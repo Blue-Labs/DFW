@@ -1,0 +1,28 @@
+[default]
+db uri          = postgres://username:password@sql-db.example.com:5432/dfw?sslmode=verify-full
+web interface   = 
+
+# this can be any word other than 'notset' as found at https://docs.python.org/3/library/logging.html#logging-levels
+log level       = info
+# log file        = /var/log/dfw
+
+local whitelist = 127.0.0.1,
+                  10.0.0.1,
+                  192.168.0.0/24
+
+node address    = 10.0.0.1
+
+
+
+[filter:mail-pit]
+# each filter can have its own of the following which will override the default value:
+#   db uri
+#   log level
+#   whitelist
+#   node address
+
+db uri = ${default:db uri}
+
+
+
+[filter:ssh-pit]
