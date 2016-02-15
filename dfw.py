@@ -29,10 +29,10 @@ TODO:
 
 '''
 
-__version__  = '1.17'
+__version__  = '1.18'
 __author__   = 'David Ford <david@blue-labs.org>'
 __email__    = 'david@blue-labs.org'
-__date__     = '2016-Feb-8 18:37E'
+__date__     = '2016-Feb-15 14:58E'
 __license__  = 'Apache 2.0'
 
 
@@ -148,6 +148,57 @@ class DFW(threading.Thread, object):
         grace_period:    must occur > <grace_count> times within <grace_period> to actually get firewalled
     '''
 
+    class __logwrapper(object):
+        printer = None
+        def __init__(self, printfunc=None):
+            if not printfunc:
+                self._logger = logging.getLogger('DFW')
+                log = self._logger
+                log.setLevel(logging.DEBUG)
+                log.info('using new logging.Logger')
+            else:
+                self._logger = printfunc
+                self.info('using {}'.format(self._logger))
+
+        def __getattr__(self, k):
+            if k in ('st'):
+                return ('','')
+            else:
+                return self.__getattribute__(k)
+
+        def set_printer(self, func):
+            self.printer = func
+
+        def critical(self, *args):
+            if self.printer:
+                self.printer(args)
+            else:
+                self._logger.critical(args)
+
+        def warning(self, *args):
+            if self.printer:
+                self.printer(args)
+            else:
+                self._logger.warning(args)
+
+        def info(self, *args, **kwargs):
+            if len(args) > 1:
+                print('info args: {!r}'.format(args))
+            if len(kwargs):
+                print('info kwargs: {!r}'.format(kwargs))
+            if self.printer:
+                self.printer(*args)
+            else:
+                self._logger.info(*args)
+
+        def debug(self, *args):
+            if self.printer:
+                self.printer(args)
+            else:
+                self._logger.debug(args)
+
+
+    '''
     # this needs to go away
     def printme(self, arg, *args, **kwargs):
 
@@ -165,7 +216,7 @@ class DFW(threading.Thread, object):
             else:
                 # gross fallback
                 self._logger(arg, *args, **kwargs)
-
+    '''
 
     def __init__(self, filter_name=None, node_address=None, dburi=None, logger=None, logparent=None, **kwargs):
         if not dburi:
@@ -186,17 +237,23 @@ class DFW(threading.Thread, object):
         if not node_address:
             raise Exception('node_address IP address must be specified')
 
-        if not logger:
-            logger = _nolog()
+        _logger = self.__logwrapper(printfunc=logger)
 
         super().__init__(**kwargs)
 
-        self._logger         = logger
+        self._logger         = _logger
         self._logparent      = logparent
         self.dburi           = dburi
 
         clienttype = __name__ == '__main__' and 'monitor' or 'client'
         self._logger.info('Distributed Firewall {} startup, analyzing local system'.format(clienttype))
+
+        # cache tunables for an hour (this ensures we catch up from lost notifications)
+        self.cache_delta     = 3600
+        self.cache           = {}
+
+        self.blocklist       = {}
+
 
         self.dunce_time      = None
         self.whitelist       = []
@@ -209,7 +266,7 @@ class DFW(threading.Thread, object):
         self.running         = True
 
         if not self.xt_recent_online:
-            self._logger.warn('no xt_recent filter in place with iptables, this filter is running but cannot act on blocks')
+            self._logger.warning('no xt_recent filter in place with iptables, this filter is running but cannot act on blocks')
 
 
     def __contains__(self, ip):
@@ -219,8 +276,10 @@ class DFW(threading.Thread, object):
 
     def shutdown(self):
         self._shutdown = True
-        #os.write(self._shutdown_pipes[1], '')
-        os.write(self._shutdown_pipes[1], b'shutdown\n')
+        try: # only the master has shutdown pipes, just ignore this for the submitters
+            os.write(self._shutdown_pipes[1], b'shutdown\n')
+        except:
+            pass
         self._logger.info('shutting down')
 
 
@@ -235,24 +294,19 @@ class DFW(threading.Thread, object):
         #print('filter:{} pid:{}'.format(self.filter_name,os.getpid()))
         #print('filter:{} tid:{}'.format(self.filter_name,x))
 
-        # cache tunables for an hour (this ensures we catch up from lost notifications)
-        self.cache_delta     = 3600
-        self.cache           = {}
-        self.blocklist       = {}
-
         try:
             os.mkdir('/run/dfw', 0o755)
         except FileExistsError:
             pass
         except Exception as e:
-            self.printme('exc mkdir: {}'.format(e))
+            self._logger.debug('exc mkdir: {}'.format(e))
 
         try:
             os.mkfifo('/run/dfw/shutdown')
         except FileExistsError:
             pass
         except Exception as e:
-            self.printme('exc mkfifi: {}'.format(e))
+            self._logger.debug('exc mkfifi: {}'.format(e))
 
         self._shutdown       = False
         self._shutdown_pipes = os.open('/run/dfw/shutdown', os.O_RDONLY|os.O_NONBLOCK), os.open('/run/dfw/shutdown', os.O_WRONLY|os.O_NONBLOCK)
@@ -318,7 +372,7 @@ class DFW(threading.Thread, object):
             c.execute(_, (self.filter_name,))
             _ = c.fetchone()
             if not _:
-                self._logger.warn('''no metadata for filter:{}, this filter will be null'''.format(self.filter_name))
+                self._logger.warning('''no metadata for filter:{}, this filter will be null'''.format(self.filter_name))
 
             else:
                 jdict = _[0]
@@ -333,7 +387,7 @@ class DFW(threading.Thread, object):
             c.execute(_, (self.filter_name,))
             _ = c.fetchall()
             if not _:
-                self._logger.warn('''CAUTION, no whitelist data for filter:{}'''.format(self.filter_name))
+                self._logger.warning('''CAUTION, no whitelist data for filter:{}'''.format(self.filter_name))
             for _r in _:
                 self._callback_update_filter_whitelist(self.conn, _r[0])
 
@@ -944,7 +998,7 @@ INSERT INTO blocklist (filter_name,node,local_port,ip,ts,blocked,reasons)
             self._update_xt_recent(ip, False)
 
         if self.running and not self.xt_recent_online:
-            self._logger.warn('no xt_recent filter in place with iptables, this filter is running but cannot act on blocks')
+            self._logger.warning('no xt_recent filter in place with iptables, this filter is running but cannot act on blocks')
 
 
     # i can't think of a reason to keep this around as is, when we need a recents count,
@@ -1132,14 +1186,14 @@ INSERT INTO blocklist (filter_name,node,local_port,ip,ts,blocked,reasons)
 
         _ = self._get_recents(self.conn, ip)
 
-        self.printme('DFW: incurred penalty for {}: {}'.format(ip,penalty))
+        self._logger.info('DFW: incurred penalty for {}: {}'.format(ip,penalty))
         __ = _ and _['recents'] or 0
-        self.printme('DFW: {} has {} recents objs'.format(ip,__))
+        self._logger.info('DFW: {} has {} recents objs'.format(ip,__))
 
         if _:
             obj['recents'] = _['recents']
             obj['penalty'] = _['penalty']
-            self.printme('DFW: {} has cumulative penalty of {}'.format(ip,obj['penalty']))
+            self._logger.info('DFW: {} has cumulative penalty of {}'.format(ip,obj['penalty']))
 
         # push our idea of timestamps to central, get back everyone's actual
         #self._logger.debug('recents for {}: {}'.format(ip, obj['recents']))
@@ -1150,19 +1204,19 @@ INSERT INTO blocklist (filter_name,node,local_port,ip,ts,blocked,reasons)
         exceeded_count = obj['recents'] > self.grace_count
         exceeded_score = obj['penalty'] > self.grace_score
 
-        self.printme('DFW: grace count={} of {}/{} score={} of {}/{}'.format(obj['recents'], self.grace_count, exceeded_count,
+        self._logger.info('DFW: grace count={} of {}/{} score={} of {}/{}'.format(obj['recents'], self.grace_count, exceeded_count,
             obj['penalty'], self.grace_score, exceeded_score))
 
         if exceeded_count or exceeded_score:
             if exceeded_count:
-                self.printme('DFW: applying ban hammer [add to firewall, exceeded permitted events within grace period]', console=True)
+                self._logger.info('DFW: applying ban hammer [add to firewall, exceeded permitted events within grace period]', console=True)
                 reasons.append('exceeded within grace period; count={} of {}'.format(obj['recents'], self.grace_count))
             if exceeded_score:
-                self.printme('DFW: applying ban hammer [add to firewall, exceeded permitted score within grace period]', console=True)
+                self._logger.info('DFW: applying ban hammer [add to firewall, exceeded permitted score within grace period]', console=True)
                 reasons.append('exceeded within grace period; score={} of {}'.format(obj['penalty'], self.grace_score))
 
             if obj['blocked_at']:
-                self.printme('DFW: double tap? last block update was at {}, updating block time'.format(obj['blocked_at']), console=True)
+                self._logger.info('DFW: double tap? last block update was at {}, updating block time'.format(obj['blocked_at']), console=True)
                 obj['blocked_at'] = now
 
             # duplicates will now be self eliminating
