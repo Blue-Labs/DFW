@@ -10,6 +10,18 @@ sharing the entries. 'Tis up to you to implement a different SQL DB interface if
 don't use py-postgresql. It needs to support LISTEN statements that yield asynchronous
 notifications.
 
+This runs as three types of units:
+
+1) the submission client which detects undesirable traffic
+    programs import this module and submit IP/penalty info for a given filter when
+    they've undesirable traffic triggers certain rules
+
+2) a running daemon which enforces firewall rules
+    the module is launched stand-alone as __main__
+
+3) a running daemon which does housekeeping on the SQL DB
+    the module is launched stand-alone as __main__ with the additional init value
+    of housekeeper=True
 
 BUGS:
    - make trigger for updates smarter on recents (and more i suspect). it can miss the fields,
@@ -18,21 +30,19 @@ BUGS:
 
 TODO:
    - i need to write a fake inotify for /proc/net/xt_recent so manually blocked IPs are registered
+   - watch /proc/net/xt_recent/* for missing filters and restart said filter when said xt_recent
+       file shows up
    - pretty webby gui for managing
-   - move the manager methods into its own daemon that runs on the main server and does the
-      periodic maintenance, no client should be doing periodic()
-   - implement multiple filter slots, aka anti-spam, ssh brute forcing, etc
    - handle dumbfucked systems where xt_recent is static and limited to 100 rules, aka don't use
       xt_recent, make a say...xt_recent chain
    - handle freebsd systems
 
-
 '''
 
-__version__  = '1.18'
+__version__  = '1.20'
 __author__   = 'David Ford <david@blue-labs.org>'
 __email__    = 'david@blue-labs.org'
-__date__     = '2016-Feb-15 14:58E'
+__date__     = '2016-Feb-19 20:27E'
 __license__  = 'Apache 2.0'
 
 
@@ -175,6 +185,12 @@ class DFW(threading.Thread, object):
             else:
                 self._logger.critical(args)
 
+        def error(self, *args):
+            if self.printer:
+                self.printer(args)
+            else:
+                self._logger.error(args)
+
         def warning(self, *args):
             if self.printer:
                 self.printer(args)
@@ -218,7 +234,7 @@ class DFW(threading.Thread, object):
                 self._logger(arg, *args, **kwargs)
     '''
 
-    def __init__(self, filter_name=None, node_address=None, dburi=None, logger=None, logparent=None, **kwargs):
+    def __init__(self, filter_name=None, node_address=None, dburi=None, logger=None, logparent=None, housekeeper=False, **kwargs):
         if not dburi:
             raise Exception("DFW isn't really a distributed firewall if there's no database to coordinate with; please set dburi")
 
@@ -244,9 +260,14 @@ class DFW(threading.Thread, object):
         self._logger         = _logger
         self._logparent      = logparent
         self.dburi           = dburi
+        self.housekeeper     = __name__ == '__main__' and housekeeper or False
 
         clienttype = __name__ == '__main__' and 'monitor' or 'client'
-        self._logger.info('Distributed Firewall {} startup, analyzing local system'.format(clienttype))
+
+        if clienttype == 'monitor' and housekeeper:
+            clienttype += ' (housekeeper)'
+
+        self._logger.info('Distributed Firewall {} startup'.format(clienttype))
 
         # cache tunables for an hour (this ensures we catch up from lost notifications)
         self.cache_delta     = 3600
@@ -343,10 +364,20 @@ class DFW(threading.Thread, object):
 
 
     def _sql_connect(self):
-        self.conn = psycopg2.connect(self.dburi)
-        if not self.conn:
-            self._logger.error('cannot mate with DB, exiting')
-            raise Exception('cannot mate with DB, exiting')
+        # retry forever
+        while True:
+            try:
+                self.conn = psycopg2.connect(self.dburi)
+            except Exception as e:
+                self._logger.error('Cannot connect to DB: {}'.format(e))
+                time.sleep(10)
+                continue
+
+            if not self.conn:
+                self._logger.error('cannot mate with DB')
+                time.sleep(10)
+            else:
+                break
 
         self.conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
 
@@ -794,7 +825,7 @@ INSERT INTO blocklist (filter_name,node,local_port,ip,ts,blocked,reasons)
                    'ts':          ts,
                    'blocked':     blocked,
                    'reasons':     reasons})
-                self._logger.debug('{};'.format(c.query.decode('utf-8')))
+                #self._logger.debug('{};'.format(c.query.decode('utf-8')))
 
 
     def _push_recents(self, ip, penalty, recents=[]):
@@ -834,7 +865,7 @@ INSERT INTO blocklist (filter_name,node,local_port,ip,ts,blocked,reasons)
         with self.conn.cursor() as c:
             c.execute(_, {'filter_name':self.filter_name, 'ip':str(ip)})
             _ = c.fetchall()
-            self._logger.debug('{};'.format(c.query.decode('latin-1')))
+            #self._logger.debug('{};'.format(c.query.decode('latin-1')))
             if _:
                 self._logger.debug('block reasons:')
                 for r in _:
@@ -875,7 +906,7 @@ INSERT INTO blocklist (filter_name,node,local_port,ip,ts,blocked,reasons)
                 _ = c.fetchall()
             else:
                 _ = c.fetchone()
-            self._logger.debug('{};'.format(c.query.decode('latin-1')))
+            #self._logger.debug('{};'.format(c.query.decode('latin-1')))
             if _:
                 self._logger.debug('recents:')
                 if not nodefetch:
@@ -931,6 +962,9 @@ INSERT INTO blocklist (filter_name,node,local_port,ip,ts,blocked,reasons)
         my_ips = list(self.blocklist)
 
         __running   = True
+        poll_timeout = None
+        if self.housekeeper:
+            poll_timeout = 1000*60*1 # one minute
 
         while __running and not self._shutdown:
             try:
@@ -949,7 +983,12 @@ INSERT INTO blocklist (filter_name,node,local_port,ip,ts,blocked,reasons)
             p.register(self._shutdown_pipes[0], select.EPOLLERR|select.EPOLLHUP|select.EPOLLIN|select.EPOLLPRI)
 
             while not self._shutdown:
-                x = p.poll()
+                x = p.poll(poll_timeout)
+
+                if not x:
+                    # timeout expired, clean up aged entries
+                    self._sql_cleanup()
+
                 try:
                     conn.poll()
                 except psycopg2.OperationalError:
@@ -996,9 +1035,6 @@ INSERT INTO blocklist (filter_name,node,local_port,ip,ts,blocked,reasons)
         else:
             self._logger.info('▶ removing block: {}'.format(ip))
             self._update_xt_recent(ip, False)
-
-        if self.running and not self.xt_recent_online:
-            self._logger.warning('no xt_recent filter in place with iptables, this filter is running but cannot act on blocks')
 
 
     # i can't think of a reason to keep this around as is, when we need a recents count,
@@ -1084,8 +1120,10 @@ INSERT INTO blocklist (filter_name,node,local_port,ip,ts,blocked,reasons)
         try:
             with open(self.xt_recent_name, 'w') as f:
                 f.write('{}'.format(ip))
+            self.xt_recent_online = True
         except FileNotFoundError:
-            pass
+            if self.running and not self.xt_recent_online:
+                self._logger.warning('no xt_recent filter in place with iptables, this filter is running but cannot act on blocks')
         except Exception as e:
             self._logger.warning('error updating firewall with: {}; {}'.format(ip,e))
 
@@ -1283,6 +1321,9 @@ if __name__ == '__main__':
     # this is only wanted when run as a listening stand-alone, submission
     # clients will make an instance per filter
 
+    # hmm, make this configurable in the future?
+    os.environ['TZ'] = 'UTC'
+
     logger = logging.getLogger('DFW')
     # if no handlers exist, a basicConfig should be setup
     if True:
@@ -1349,7 +1390,9 @@ if __name__ == '__main__':
         _logger = logging.getLogger(filter)
         _logger.setLevel(log_level)
 
-        dfw = DFW(filter_name=filter, node_address=node_address, dburi=dburi, logger=_logger, name='DFW:'+filter)
+        hk = 'housekeeper' in sys.argv
+
+        dfw = DFW(filter_name=filter, node_address=node_address, dburi=dburi, logger=_logger, name='DFW:'+filter, housekeeper=hk)
 
         if local_whitelist:
             dfw.ignore(local_whitelist)
