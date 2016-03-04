@@ -214,57 +214,56 @@ class DFW(threading.Thread, object):
                 self._logger.debug(args)
 
 
-    '''
-    # this needs to go away
-    def printme(self, arg, *args, **kwargs):
-
-        if self._logparent:
-            self._logger(arg, *args, **kwargs)
-        else:
-            if isinstance(self._logger, logging.Logger):
-                lvl = 'level' in kwargs and kwargs['level'] or logging.INFO
-                # remove 'console' from kwargs
-                if 'console' in kwargs: del kwargs['console']
-                self._logger.log(lvl, arg, *args, **kwargs)
-            elif isinstance(self._logger, _nolog):
-                if 'console' in kwargs: del kwargs['console']
-                self._logger(arg, *args, **kwargs)
-            else:
-                # gross fallback
-                self._logger(arg, *args, **kwargs)
-    '''
-
-    def __init__(self, filter_name=None, node_address=None, dburi=None, logger=None, logparent=None, housekeeper=False, **kwargs):
+    def __init__(self, name=None, node_address=None, dburi=None, **kwargs):
         if not dburi:
             raise Exception("DFW isn't really a distributed firewall if there's no database to coordinate with; please set dburi")
-
-        if not filter_name and isinstance(filter_name, str) and re.match('[\w_.-]+$', filter_name):
-            raise Exception('filter_name must be a real file name in /proc/net/xt_recent/...')
-
-        self.xt_recent_online = False
-        try:
-            _f = os.path.join('/proc/net/xt_recent', filter_name)
-            with open(_f) as f:
-                pass
-            self.xt_recent_online = True
-        except:
-            logger.warning('not registered in iptables yet, this node will not be protected'.format(filter_name))
 
         if not node_address:
             raise Exception('node_address IP address must be specified')
 
-        _logger = self.__logwrapper(printfunc=logger)
+        filter_name = 'DFW:'+name
 
-        super().__init__(**kwargs)
+        if 'logger' in kwargs:
+            _logger = self.__logwrapper(printfunc=kwargs['logger'])
 
-        self._logger         = _logger
-        self._logparent      = logparent
-        self.dburi           = dburi
-        self.housekeeper     = __name__ == '__main__' and housekeeper or False
+        th_args = {'name':filter_name}
+        for kw in ('group','target','daemon'):
+            if kw in kwargs:
+                th_args[kw]=kwargs.get(kw)
+                del kwargs[kw]
+
+        super().__init__(**th_args, kwargs=kwargs)
+
+        self._logger          = _logger
+        self.dburi            = dburi
+        self.use_nftables     = kwargs.get('use_nftables')
+        self.housekeeper      = __name__ == '__main__' and kwargs.get('housekeeper') or False
+        self.housekeeper_only = __name__ == '__main__' and kwargs.get('housekeeperonly') or False
+        self.xt_recent_online = False
+
+        #if self.use_nftables:
+        #    from pyroute2 import
+
+        # in with the new, out with the old -- nftables is the new
+        if not self.use_nftables:
+            if not filter_name and isinstance(name, str) and re.match('[\w_.-]+$', name):
+                raise Exception('filter_name must be a real file name in /proc/net/xt_recent/...')
+
+            try:
+                _f = os.path.join('/proc/net/xt_recent', name)
+                with open(_f) as f:
+                    pass
+                self.xt_recent_online = True
+            except:
+                _logger.warning('a "... -m recent CHECK name: {} ..." rule is not registered in iptables yet, this filter will not be active'.format(filter_name))
+        else:
+            # we can set up an nftables table and chains, but we need meta information from sql first
+            pass
+
 
         clienttype = __name__ == '__main__' and 'monitor' or 'client'
 
-        if clienttype == 'monitor' and housekeeper:
+        if clienttype == 'monitor' and (self.housekeeper or self.housekeeperonly):
             clienttype += ' (housekeeper)'
 
         self._logger.info('Distributed Firewall {} startup'.format(clienttype))
@@ -286,8 +285,16 @@ class DFW(threading.Thread, object):
         self._sql_connect()
         self.running         = True
 
-        if not self.xt_recent_online:
-            self._logger.warning('no xt_recent filter in place with iptables, this filter is running but cannot act on blocks')
+        if not self.use_nftables:
+            if not self.xt_recent_online:
+                self._logger.warning('no xt_recent filter in place with iptables, this filter is running but cannot act on blocks')
+        else:
+            # verify we have a table/chain set up for nftables, if not, make one
+            # first, do we have 'nft' binary?
+            try:
+                subprocess.check_output(['nft','-v'])
+            except:
+                raise Exception('nftables use requested but no "nft" program installed')
 
 
     def __contains__(self, ip):
@@ -963,7 +970,7 @@ INSERT INTO blocklist (filter_name,node,local_port,ip,ts,blocked,reasons)
 
         __running   = True
         poll_timeout = None
-        if self.housekeeper:
+        if self.housekeeper or self.housekeeper_only:
             poll_timeout = 1000*60*1 # one minute
 
         while __running and not self._shutdown:
@@ -979,8 +986,9 @@ INSERT INTO blocklist (filter_name,node,local_port,ip,ts,blocked,reasons)
                 c.execute('LISTEN dfw')
 
             p = select.poll()
-            p.register(conn, select.EPOLLIN|select.EPOLLERR|select.EPOLLHUP|select.EPOLLPRI)
             p.register(self._shutdown_pipes[0], select.EPOLLERR|select.EPOLLHUP|select.EPOLLIN|select.EPOLLPRI)
+            if not self.housekeeper_only:
+                p.register(conn, select.EPOLLIN|select.EPOLLERR|select.EPOLLHUP|select.EPOLLPRI)
 
             while not self._shutdown:
                 x = p.poll(poll_timeout)
@@ -988,6 +996,8 @@ INSERT INTO blocklist (filter_name,node,local_port,ip,ts,blocked,reasons)
                 if not x:
                     # timeout expired, clean up aged entries
                     self._sql_cleanup()
+                if self.housekeeper_only:
+                    continue
 
                 try:
                     conn.poll()
@@ -1004,8 +1014,6 @@ INSERT INTO blocklist (filter_name,node,local_port,ip,ts,blocked,reasons)
                     table  = jdict['table']
                     _f     = getattr(self, '_callback_update_'+table)
                     _f(conn, jdict)
-
-                    #self._forgive()
 
 
     ''' NOTE!!!
@@ -1288,7 +1296,7 @@ INSERT INTO blocklist (filter_name,node,local_port,ip,ts,blocked,reasons)
 
         _ = self._get_blocked(ip)
         if _:
-            return _[0] + datetime.timedelta(hours=24)
+            return _[0] + self.dunce_time
 
 
 class web_interface(threading.Thread):
@@ -1370,6 +1378,7 @@ if __name__ == '__main__':
 
         dburi           = _cg_None(config, 'filter:'+filter, 'db uri')
         log_level       = _cg_None(config, 'filter:'+filter, 'log level')
+        use_nftables    = _cg_None(config, 'filter:'+filter, 'use nftables')
         node_address    = _cg_None(config, 'filter:'+filter, 'node address')
         local_whitelist = _cg_None(config, 'filter:'+filter, 'local whitelist') or ''
 
@@ -1386,13 +1395,24 @@ if __name__ == '__main__':
             logger.error('the following config parameters are required for filter: {}; {}'.format(filter,errs))
             continue
 
-        log_level = _get_log_level(config, 'default')
+        _log_level = _get_log_level(config, 'default')
         _logger = logging.getLogger(filter)
-        _logger.setLevel(log_level)
+        _logger.setLevel(_log_level)
 
-        hk = 'housekeeper' in sys.argv
+        _log_file  = _cg_None(config, 'default', 'log file') or '/var/log/dfw'
 
-        dfw = DFW(filter_name=filter, node_address=node_address, dburi=dburi, logger=_logger, name='DFW:'+filter, housekeeper=hk)
+        _fh = logging.handlers.TimedRotatingFileHandler(filename=log_file+':'+filter, when='midnight', backupCount=14, encoding='utf-8')
+        _fm = logging.Formatter(fmt='%(asctime)-8s %(levelname)-.1s %(name)s %(message)s', datefmt='%F %TZ')
+
+        _fh.setFormatter(_fm)
+        _logger.addHandler(_fh)
+
+        hk  = 'housekeeper' in sys.argv
+        hko = 'housekeeperonly' in sys.argv
+
+        dfw = DFW(name=filter, node_address=node_address, dburi=dburi,
+                 **{'use_nftables':use_nftables, 'logger':_logger,
+                  'housekeeper':hk, 'housekeeperonly':hko})
 
         if local_whitelist:
             dfw.ignore(local_whitelist)
