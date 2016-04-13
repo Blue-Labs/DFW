@@ -39,10 +39,10 @@ TODO:
 
 '''
 
-__version__  = '1.20'
+__version__  = '1.21'
 __author__   = 'David Ford <david@blue-labs.org>'
 __email__    = 'david@blue-labs.org'
-__date__     = '2016-Feb-19 20:27E'
+__date__     = '2016-Apr-13 01:53Z'
 __license__  = 'Apache 2.0'
 
 
@@ -198,10 +198,10 @@ class DFW(threading.Thread, object):
                 self._logger.warning(args)
 
         def info(self, *args, **kwargs):
-            if len(args) > 1:
-                print('info args: {!r}'.format(args))
-            if len(kwargs):
-                print('info kwargs: {!r}'.format(kwargs))
+            #if len(args) > 1:
+            #    print('info args: {!r}'.format(args))
+            #if len(kwargs):
+            #    print('info kwargs: {!r}'.format(kwargs))
             if self.printer:
                 self.printer(*args)
             else:
@@ -263,7 +263,7 @@ class DFW(threading.Thread, object):
 
         clienttype = __name__ == '__main__' and 'monitor' or 'client'
 
-        if clienttype == 'monitor' and (self.housekeeper or self.housekeeperonly):
+        if clienttype == 'monitor' and (self.housekeeper or self.housekeeper_only):
             clienttype += ' (housekeeper)'
 
         self._logger.info('Distributed Firewall {} startup'.format(clienttype))
