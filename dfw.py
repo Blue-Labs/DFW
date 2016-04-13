@@ -39,10 +39,10 @@ TODO:
 
 '''
 
-__version__  = '1.21'
+__version__  = '1.22'
 __author__   = 'David Ford <david@blue-labs.org>'
 __email__    = 'david@blue-labs.org'
-__date__     = '2016-Apr-13 01:53Z'
+__date__     = '2016-Apr-13 23:50Z'
 __license__  = 'Apache 2.0'
 
 
@@ -221,12 +221,12 @@ class DFW(threading.Thread, object):
         if not node_address:
             raise Exception('node_address IP address must be specified')
 
-        filter_name = 'DFW:'+name
+        filter_name = name
 
         if 'logger' in kwargs:
             _logger = self.__logwrapper(printfunc=kwargs['logger'])
 
-        th_args = {'name':filter_name}
+        th_args = {'name':'DFW:'+filter_name}
         for kw in ('group','target','daemon'):
             if kw in kwargs:
                 th_args[kw]=kwargs.get(kw)
@@ -255,7 +255,7 @@ class DFW(threading.Thread, object):
                     pass
                 self.xt_recent_online = True
             except:
-                _logger.warning('a "... -m recent CHECK name: {} ..." rule is not registered in iptables yet, this filter will not be active'.format(filter_name))
+                self._logger.warning('a "... -m recent CHECK name: {} ..." rule is not registered in iptables yet, this filter will not be active'.format(filter_name))
         else:
             # we can set up an nftables table and chains, but we need meta information from sql first
             pass
