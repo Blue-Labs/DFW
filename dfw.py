@@ -39,10 +39,10 @@ TODO:
 
 '''
 
-__version__  = '1.22'
+__version__  = '1.23'
 __author__   = 'David Ford <david@blue-labs.org>'
 __email__    = 'david@blue-labs.org'
-__date__     = '2016-Apr-13 23:50Z'
+__date__     = '2016-Apr-14 00:31Z'
 __license__  = 'Apache 2.0'
 
 
@@ -863,10 +863,13 @@ INSERT INTO blocklist (filter_name,node,local_port,ip,ts,blocked,reasons)
              FROM  blocklist b
         LEFT JOIN  filter_whitelist fw
                ON  (fw.address = b.ip AND fw.filter_name = b.filter_name)
+        LEFT JOIN  filter_meta fm
+               ON  (fm.filter_name = b.filter_name)
             WHERE  b.filter_name=%(filter_name)s
               AND  fw.address IS NULL
               AND  b.ip = %(ip)s
               AND  b.blocked
+              AND  b.ts + fm.dunce_time > now() at time zone 'utc'
          ORDER BY  b.ts
             LIMIT  1 '''
         with self.conn.cursor() as c:
