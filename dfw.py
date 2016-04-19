@@ -46,32 +46,32 @@ __date__     = '2016-Apr-14 00:31Z'
 __license__  = 'Apache 2.0'
 
 
-import ctypes
 import datetime
-import io
 import netaddr
 import json
-import logging, logging.handlers
+import logging
+import logging.handlers
 import os
 import re
 import select
 import sys
 import time
-import traceback
 import threading
+import ctypes
+import ctypes.util
+import subprocess
 
 from configparser import ConfigParser, ExtendedInterpolation
 
 # 3rd party
 import psycopg2, psycopg2.extras, psycopg2.extensions
-from dateutil import parser
 
 # BlueLabs modules
 sys.path.append('/var/bluelabs/python')
 import lkhz
 
 # monkey patch threading to set /proc/self/task/[tid]/comm value
-import ctypes, ctypes.util, threading
+
 libpthread_path = ctypes.util.find_library("pthread")
 if libpthread_path:
     libpthread = ctypes.CDLL(libpthread_path)
@@ -969,7 +969,7 @@ INSERT INTO blocklist (filter_name,node,local_port,ip,ts,blocked,reasons)
         monitor changes to the xt_recent file that we didn't make, this will entail detecting +/- in our list
         note: driver/pq3.py is NOT threadsafe, we'll use our own connection here.
         '''
-        my_ips = list(self.blocklist)
+        #my_ips = list(self.blocklist)
 
         __running   = True
         poll_timeout = None
