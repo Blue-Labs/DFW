@@ -39,12 +39,11 @@ TODO:
 
 '''
 
-__version__  = '1.23'
+__version__  = '1.24'
 __author__   = 'David Ford <david@blue-labs.org>'
 __email__    = 'david@blue-labs.org'
-__date__     = '2016-Apr-14 00:31Z'
+__date__     = '2016-Apr-20 02:49Z'
 __license__  = 'Apache 2.0'
-
 
 import datetime
 import netaddr
@@ -60,15 +59,19 @@ import threading
 import ctypes
 import ctypes.util
 import subprocess
+import psycopg2
+import psycopg2.extras
+import psycopg2.extensions
 
-from configparser import ConfigParser, ExtendedInterpolation
-
-# 3rd party
-import psycopg2, psycopg2.extras, psycopg2.extensions
+from configparser import ConfigParser
+from configparser import ExtendedInterpolation
 
 # BlueLabs modules
 sys.path.append('/var/bluelabs/python')
 import lkhz
+
+logging.captureWarnings(True)
+
 
 # monkey patch threading to set /proc/self/task/[tid]/comm value
 
@@ -105,10 +108,10 @@ class _nolog():
     def __call__(self, *arg, **kwargs):
         self.__print(*arg, **kwargs)
     def __print(self, arg, kwargs=None):
-        print('{}'.format(datetime.datetime.utcnow().strftime('%F %TZ')),'%s' %arg)
+        print('<nolog> {} {} {}'.format(datetime.datetime.utcnow().strftime('%F %TZ')),'%s' %arg, kwargs)
     def error(self, arg):
         self.__print(arg)
-    def warn(self, arg):
+    def warning(self, arg):
         self.__print(arg)
     def info(self, arg):
         self.__print(arg)
@@ -163,55 +166,23 @@ class DFW(threading.Thread, object):
         def __init__(self, printfunc=None):
             if not printfunc:
                 self._logger = logging.getLogger('DFW')
-                log = self._logger
-                log.setLevel(logging.DEBUG)
-                log.info('using new logging.Logger')
+                self._logger.setLevel(logging.DEBUG)
+                self.info('using new logging.Logger instance')
             else:
                 self._logger = printfunc
-                self.info('using {}'.format(self._logger))
+                #self.info('***** using {}'.format(self._logger))
 
-        def __getattr__(self, k):
-            if k in ('st'):
-                return ('','')
-            else:
-                return self.__getattribute__(k)
+        def __getattribute__(self, k):
+            if k in ('critical','error','warning','info','debug'):
+                if object.__getattribute__(self, 'printer'):
+                    return object.__getattribute__(self, 'printer')
+                x = object.__getattribute__(self, '_logger')
+                c = object.__getattribute__(x, k)
+                return c
+            return object.__getattribute__(self, k)
 
         def set_printer(self, func):
             self.printer = func
-
-        def critical(self, *args):
-            if self.printer:
-                self.printer(args)
-            else:
-                self._logger.critical(args)
-
-        def error(self, *args):
-            if self.printer:
-                self.printer(args)
-            else:
-                self._logger.error(args)
-
-        def warning(self, *args):
-            if self.printer:
-                self.printer(args)
-            else:
-                self._logger.warning(args)
-
-        def info(self, *args, **kwargs):
-            #if len(args) > 1:
-            #    print('info args: {!r}'.format(args))
-            #if len(kwargs):
-            #    print('info kwargs: {!r}'.format(kwargs))
-            if self.printer:
-                self.printer(*args)
-            else:
-                self._logger.info(*args)
-
-        def debug(self, *args):
-            if self.printer:
-                self.printer(args)
-            else:
-                self._logger.debug(args)
 
 
     def __init__(self, name=None, node_address=None, dburi=None, **kwargs):
@@ -225,6 +196,8 @@ class DFW(threading.Thread, object):
 
         if 'logger' in kwargs:
             _logger = self.__logwrapper(printfunc=kwargs['logger'])
+        else:
+            _logger = self.__logwrapper()
 
         th_args = {'name':'DFW:'+filter_name}
         for kw in ('group','target','daemon'):
@@ -287,7 +260,7 @@ class DFW(threading.Thread, object):
 
         if not self.use_nftables:
             if not self.xt_recent_online:
-                self._logger.warning('no xt_recent filter in place with iptables, this filter is running but cannot act on blocks')
+                self._logger.warning("no xt_recent filter in place with iptables, filter running but can't respond")
         else:
             # verify we have a table/chain set up for nftables, if not, make one
             # first, do we have 'nft' binary?
@@ -315,6 +288,8 @@ class DFW(threading.Thread, object):
         ''' entry point for manager thread. we wait 1 second on launch to allow main
             thread to finish printing config messages
         '''
+
+        self.running         = False
 
         #time.sleep(1)
         #x = ctypes.CDLL('libc.so.6').syscall(224)
@@ -345,6 +320,8 @@ class DFW(threading.Thread, object):
         self._build_blocklist()
 
         self._logger.info('initial entry count for {}: {}'.format(self.filter_name, len([x for x,meta in self.blocklist.items() if meta['blocked_at']])))
+
+        self.running         = True
         self._periodic()
 
 
@@ -361,7 +338,7 @@ class DFW(threading.Thread, object):
             try:
                 with self.conn.cursor() as c:
                     c.execute('SELECT 1')
-            except psycopg2.OperationalError:
+            except (psycopg2.OperationalError, psycopg2.DatabaseError):
                 reconnect = True
 
         if not reconnect:
@@ -725,7 +702,7 @@ INSERT INTO blocklist (filter_name,node,local_port,ip,ts,blocked,reasons)
         # these are listed as blocked in sql but i don't have them
         for ip in [ip for ip in _bl if _b[ip]['blocked_at'] and not ip in _xl ]:
             # don't spam on startup
-            if not self.running:
+            if self.running:
                 self._logger.info('▶ new block: {}'.format(ip))
             self._update_xt_recent(ip, True)
 
@@ -1134,7 +1111,7 @@ INSERT INTO blocklist (filter_name,node,local_port,ip,ts,blocked,reasons)
             self.xt_recent_online = True
         except FileNotFoundError:
             if self.running and not self.xt_recent_online:
-                self._logger.warning('no xt_recent filter in place with iptables, this filter is running but cannot act on blocks')
+                self._logger.warning("no xt_recent filter in place with iptables, filter running but can't respond")
         except Exception as e:
             self._logger.warning('error updating firewall with: {}; {}'.format(ip,e))
 
@@ -1335,13 +1312,9 @@ if __name__ == '__main__':
     # hmm, make this configurable in the future?
     os.environ['TZ'] = 'UTC'
 
-    logger = logging.getLogger('DFW')
-    # if no handlers exist, a basicConfig should be setup
-    if True:
-        logging.basicConfig(format='%(asctime)-8s %(levelname)-.1s %(name)s %(message)s', datefmt='%F %TZ')
-
-    configfile   = '/etc/DFW/dfw.conf'
-    config = ConfigParser(allow_no_value=True, interpolation=ExtendedInterpolation())
+    logger     = logging.getLogger('DFW')
+    configfile = '/etc/DFW/dfw.conf'
+    config     = ConfigParser(allow_no_value=True, interpolation=ExtendedInterpolation())
 
     if not config.read(configfile):
         logger.warning('Error reading required configuration file: {}'.format(configfile))
@@ -1363,6 +1336,10 @@ if __name__ == '__main__':
     fh.setFormatter(fm)
     logger.addHandler(fh)
 
+    # install handler for console output
+    ch = logging.StreamHandler()
+    ch.setFormatter(fm)
+    logger.addHandler(ch)
 
     # at least one filter must be named
     filters = [f[7:] for f in config if f.startswith('filter:') \
@@ -1399,7 +1376,7 @@ if __name__ == '__main__':
             continue
 
         _log_level = _get_log_level(config, 'default')
-        _logger = logging.getLogger(filter)
+        _logger = logger.getChild(filter)
         _logger.setLevel(_log_level)
 
         _log_file  = _cg_None(config, 'default', 'log file') or '/var/log/dfw'
@@ -1412,6 +1389,7 @@ if __name__ == '__main__':
 
         hk  = 'housekeeper' in sys.argv
         hko = 'housekeeperonly' in sys.argv
+        _logger.critical('logger established for filter: {}'.format(filter))
 
         dfw = DFW(name=filter, node_address=node_address, dburi=dburi,
                  **{'use_nftables':use_nftables, 'logger':_logger,
