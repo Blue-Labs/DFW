@@ -1,13 +1,11 @@
 #!/usr/bin/env python
 
-''' Distributed firewall blacklisting based on xt_recent. This is a LINUX based tool.
-
-There's no python output from this class, it's a one way control of the assigned xt_recent
-iptables extension.
+''' Distributed firewall blacklisting based on xt_recent. This is (currently) a LINUX
+based tool.
 
 Being a distributed system, a network reachable SQL table is needed for storing and
 sharing the entries. 'Tis up to you to implement a different SQL DB interface if you
-don't use py-postgresql. It needs to support LISTEN statements that yield asynchronous
+don't use postgresql. It needs to support LISTEN statements that yield asynchronous
 notifications.
 
 This runs as three types of units:
@@ -15,31 +13,39 @@ This runs as three types of units:
 1) the submission client which detects undesirable traffic
     programs import this module and submit IP/penalty info for a given filter when
     they've undesirable traffic triggers certain rules
+    v1: posts to pgsql and uses NOTIFY triggers
+    v2: uses WAMP and publishes to a channel
 
 2) a running daemon which enforces firewall rules
     the module is launched stand-alone as __main__
+    v1: listens for NOTIFY
+    v2: subscribes to a WAMP channel
 
 3) a running daemon which does housekeeping on the SQL DB
     the module is launched stand-alone as __main__ with the additional init value
     of housekeeper=True
+    v1: select/update/delete on pgsql
+    v2: ... also publishes the update/delete info to WAMP channel
 
 BUGS:
-   - make trigger for updates smarter on recents (and more i suspect). it can miss the fields,
-     need to refer to OLD if NEW is void...
+   - make trigger for updates smarter on recents (and more i suspect). it can miss the
+     fields, need to refer to OLD if NEW is void...
    - initial load finds new blocks from the recents file, not blocklist
 
 TODO:
-   - i need to write a fake inotify for /proc/net/xt_recent so manually blocked IPs are registered
-   - watch /proc/net/xt_recent/* for missing filters and restart said filter when said xt_recent
-       file shows up
+   - i need to write a fake inotify for /proc/net/xt_recent so manually blocked IPs are
+       registered
+   - watch /proc/net/xt_recent/* for missing filters and restart said filter when said
+       xt_recent file shows up
    - pretty webby gui for managing
-   - handle dumbfucked systems where xt_recent is static and limited to 100 rules, aka don't use
-      xt_recent, make a say...xt_recent chain
+   - handle dumbfucked systems where xt_recent is static and limited to 100 rules, aka
+       don't use xt_recent, make a say...xt_recent chain
    - handle freebsd systems
+   - modern linux systems are nftables, support that too
 
 '''
 
-__version__  = '1.24'
+__version__  = '1.25'
 __author__   = 'David Ford <david@blue-labs.org>'
 __email__    = 'david@blue-labs.org'
 __date__     = '2016-Apr-20 02:49Z'
@@ -65,6 +71,16 @@ import psycopg2.extensions
 
 from configparser import ConfigParser
 from configparser import ExtendedInterpolation
+
+# crossbar/autobahn
+try:
+    import asyncio
+    import txaio
+    from autobahn                import wamp
+    from autobahn.asyncio.wamp   import ApplicationSession, ApplicationRunner
+    from autobahn.wamp.types     import PublishOptions, SubscribeOptions, RegisterOptions
+except:
+    print('WAMP components not available yet')
 
 # BlueLabs modules
 sys.path.append('/var/bluelabs/python')
@@ -278,8 +294,9 @@ class DFW(threading.Thread, object):
     def shutdown(self):
         self._shutdown = True
         try: # only the master has shutdown pipes, just ignore this for the submitters
-            os.write(self._shutdown_pipes[1], b'shutdown\n')
-        except:
+            os.write(self._shutdown_pipes[1], '{} shutdown\n'.format(os.getpid()).encode())
+        except Exception as e:
+            self._logger.warning('failed to write to shutdown pipe: {}'.format(e))
             pass
         self._logger.info('shutting down')
 
@@ -313,6 +330,16 @@ class DFW(threading.Thread, object):
 
         self._shutdown       = False
         self._shutdown_pipes = os.open('/run/dfw/shutdown', os.O_RDONLY|os.O_NONBLOCK), os.open('/run/dfw/shutdown', os.O_WRONLY|os.O_NONBLOCK)
+
+        # purge anything left sitting in the pipe from an earlier process
+        p = select.poll()
+        p.register(self._shutdown_pipes[0], select.EPOLLIN)
+        while True:
+            x = p.poll(1)
+            if x:
+                self._logger.debug('flushing shutdown pipe: {!r}'.format(os.read(x[0][0], 128)))
+            else:
+                break
 
         self.lkhz = lkhz.LKHZ()
         self.lkhz.calibrate()
@@ -367,7 +394,7 @@ class DFW(threading.Thread, object):
 
         self._logger.info('connecting to DFW SQL server with SSL')
 
-        if __name__ == '__main__':
+        if __name__ == '__main__' and (self.housekeeper or self.housekeeper_only):
             self._sql_setup()
 
         # fire off a trigger to populate our meta data for this filter
@@ -605,11 +632,19 @@ INSERT INTO blocklist (filter_name,node,local_port,ip,ts,blocked,reasons)
                 $$
                 '''
 
-            c.execute(_proc)
+            try:
+                c.execute(_proc)
+            except Exception as e:
+                if not str(e) == 'tuple concurrently updated':
+                    raise
 
             for table in {'blocklist','recents','filter_meta','filter_whitelist'}:
                 for op,when in {'insert':'BEFORE','update':'AFTER','delete':'BEFORE'}.items():
-                    c.execute(_trig.format(op=op, when=when, table=table))
+                    try:
+                        c.execute(_trig.format(op=op, when=when, table=table))
+                    except Exception as e:
+                        if not str(e) == 'tuple concurrently updated':
+                            raise
 
             _rule = '''
             CREATE OR REPLACE FUNCTION fix_inet_masklen_f() RETURNS TRIGGER AS $$
@@ -629,7 +664,11 @@ INSERT INTO blocklist (filter_name,node,local_port,ip,ts,blocked,reasons)
             $$ LANGUAGE plpgsql;
             '''
 
-            c.execute(_rule)
+            try:
+                c.execute(_rule)
+            except Exception as e:
+                if not str(e) == 'tuple concurrently updated':
+                    raise
 
             _trig = '''
             CREATE TRIGGER verify_inet_masklen_t
@@ -641,7 +680,12 @@ INSERT INTO blocklist (filter_name,node,local_port,ip,ts,blocked,reasons)
 
             for table in {'blocklist','recents'}:
                 c.execute('DROP TRIGGER IF EXISTS verify_inet_masklen_t ON {}'.format(table))
-                c.execute(_trig.format(table=table))
+                try:
+                    c.execute(_trig.format(table=table))
+                except Exception as e:
+                    if not str(e).endswith('already exists'):
+                        raise
+
 
 
     def _build_blocklist(self, initial=False):
@@ -972,28 +1016,50 @@ INSERT INTO blocklist (filter_name,node,local_port,ip,ts,blocked,reasons)
 
             while not self._shutdown:
                 x = p.poll(poll_timeout)
+                pg_conn_found = False
+
+                for fd,ev in x:
+                    if fd == self._shutdown_pipes[0]:
+                        if ev == select.EPOLLIN:
+                            try:
+                                _readval = os.read(self._shutdown_pipes[0], 256).decode().strip()
+                                _mypid = str(os.getpid())
+                                if _readval.split(' ')[0] == _mypid:
+                                    self._logger.debug('read on shutdown pipe: {!r}'.format(_readval))
+                                else:
+                                    self._logger.debug('read shutdown for another process on pipe: {}'.format(_readval))
+                            except:
+                                pass # another thread may have already read it, we don't care
+
+                        else:
+                            self._logger.warning('unexpected event on shutdown pipe: {}'.format(ev))
+                        continue
+                    elif fd == conn.fileno():
+                        pg_conn_found = True
 
                 if not x:
                     # timeout expired, clean up aged entries
                     self._sql_cleanup()
+
                 if self.housekeeper_only:
                     continue
 
-                try:
-                    conn.poll()
-                except psycopg2.OperationalError:
-                    self._logger.error('OpErr')
-                    break
-                except Exception as e:
-                    self._logger.error('error polling DB: {}'.format(e))
-                    break
+                if pg_conn_found:
+                    try:
+                        conn.poll()
+                    except psycopg2.OperationalError:
+                        self._logger.error('OpErr')
+                        break
+                    except Exception as e:
+                        self._logger.error('error polling DB: {}'.format(e))
+                        break
 
-                while conn.notifies:
-                    notify = conn.notifies.pop(0)
-                    jdict  = json.loads(notify.payload)
-                    table  = jdict['table']
-                    _f     = getattr(self, '_callback_update_'+table)
-                    _f(conn, jdict)
+                    while conn.notifies:
+                        notify = conn.notifies.pop(0)
+                        jdict  = json.loads(notify.payload)
+                        table  = jdict['table']
+                        _f     = getattr(self, '_callback_update_'+table)
+                        _f(conn, jdict)
 
 
     ''' NOTE!!!
